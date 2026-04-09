@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Civvi - Cibi Bluetooth</title>
+  <style>
+    body { background-color: #121212; color: #fff; font-family: sans-serif; margin: 0; padding: 15px; overflow-x: hidden; display: flex; flex-direction: column; min-height: 95vh; }
+    
+    #overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); display: flex; align-items: center; justify-content: center; z-index: 100; flex-direction: column; }
+    #overlay button { padding: 20px 40px; font-size: 20px; font-weight: bold; background: #B2CEFF; color: #121212; border: none; border-radius: 12px; cursor: pointer; box-shadow: 0 4px 15px rgba(178,206,255,0.4); transition: 0.3s; }
+    #overlay button:active { transform: scale(0.95); }
+    #overlay p { margin-top: 20px; color: #aaa; text-align: center; max-width: 80%; line-height: 1.5; }
+
+    #prompters { display: flex; flex-direction: column; justify-content: flex-end; gap: 15px; flex-grow: 1; margin-bottom: 20px; margin-top: 20px; }
+    
+    .esp-line {
+      display: flex;
+      background: #1a1a1a;
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+      font-size: 24px;
+      border-left: 6px solid;
+    }
+
+    .cartouche {
+      background: #222;
+      padding: 15px 20px;
+      font-weight: bold;
+      z-index: 10;
+      box-shadow: 3px 0 8px rgba(0,0,0,0.6);
+      white-space: nowrap;
+      text-shadow: 1px 1px 2px #000;
+      display:flex;
+      align-items: center;
+    }
+
+    .riviere {
+      flex-grow: 1;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      white-space: nowrap;
+    }
+    
+    .scrolling-text {
+      display: inline-block;
+      padding-left: 100%;
+      will-change: transform;
+    }
+
+    @keyframes scroll-left {
+      0% { transform: translateX(0); }
+      100% { transform: translateX(-100%); }
+    }
+    
+    .controls { background: #222; padding: 15px; border-radius: 10px; display: flex; gap: 10px; box-shadow: 0 -4px 10px rgba(0,0,0,0.5); }
+    input[type="text"] { flex-grow: 1; padding: 15px; border-radius: 6px; border: 1px solid #444; background: #111; color: #fff; font-size: 16px; }
+    button { background: #B2CEFF; color: #121212; padding: 15px 25px; border: none; border-radius: 6px; font-weight: bold; font-size: 16px; cursor: pointer; transition: 0.2s; white-space: nowrap; }
+    button:active { transform: scale(0.95); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+
+  <div id="overlay">
+    <button id="btn-connect" onclick="connectBluetooth()">Se connecter à la Cibi</button>
+    <p>Cette interface communique avec l'ESP32 directement via Bluetooth au lieu du WiFi. Nécessite Google Chrome ou un navigateur compatible Web Bluetooth.</p>
+  </div>
+
+  <div id="prompters"></div>
+
+  <div class="controls">
+    <input type="text" id="msg" placeholder="Rédigez votre pensée (jusqu'à 3500 caractères)..." maxlength="3500" disabled>
+    <button id="btn-send" onclick="sendToESP()" disabled>Diffuser</button>
+  </div>
+  
+  <div id="mon-message-container" style="margin-top: 15px; display: none; align-items: center; background: #1a1a1a; border-radius: 8px; padding: 10px 15px; border-left: 6px solid #B2CEFF;">
+    <div style="font-weight: bold; color: #B2CEFF; margin-right: 15px; white-space: nowrap;">Dernier message :</div>
+    <div id="mon-message-texte" style="flex-grow: 1; font-size: 18px; font-style: italic; opacity: 0.9;"></div>
+  </div>
+
+  <script>
+    // ===== WEBSOCKET BLUETOOTH =====
+    const serviceUuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const rxCharacteristicUuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // Pour écrire sur l'ESP
+    const txCharacteristicUuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // Pour lire l'ESP
+
+    let bleDevice;
+    let bleServer;
+    let rxCharacteristic;
+    let txCharacteristic;
+    let receiveBuffer = "";
+
+    async function connectBluetooth() {
+      try {
+        let btn = document.getElementById('btn-connect');
+        btn.innerText = "Recherche...";
+        
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [ { namePrefix: 'Civvi' } ],
+          optionalServices: [serviceUuid]
+        });
+        
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+        btn.innerText = "Connexion...";
+        
+        bleServer = await bleDevice.gatt.connect();
+        const service = await bleServer.getPrimaryService(serviceUuid);
+        
+        txCharacteristic = await service.getCharacteristic(txCharacteristicUuid);
+        rxCharacteristic = await service.getCharacteristic(rxCharacteristicUuid);
+        
+        txCharacteristic.addEventListener('characteristicvaluechanged', handleNotifications);
+        await txCharacteristic.startNotifications();
+        
+        document.getElementById('overlay').style.display = 'none';
+        document.getElementById('msg').disabled = false;
+        document.getElementById('btn-send').disabled = false;
+
+      } catch (error) {
+        console.error("Bluetooth error:", error);
+        document.getElementById('btn-connect').innerText = "Connexion annulée / Erreur";
+      }
+    }
+
+    function onDisconnected() {
+      document.getElementById('overlay').style.display = 'flex';
+      document.getElementById('btn-connect').innerText = "Reconnexion...";
+      document.getElementById('msg').disabled = true;
+      document.getElementById('btn-send').disabled = true;
+      // Option pour tenter de se reconnecter
+    }
+
+    function handleNotifications(event) {
+      let value = event.target.value;
+      let text = new TextDecoder().decode(value);
+      receiveBuffer += text;
+      
+      if (receiveBuffer.endsWith('\n')) {  // La balise de fin envoyée par l'ESP
+         try {
+           let data = JSON.parse(receiveBuffer.trim());
+           receiveBuffer = "";
+           mettreAJourInterface(data);
+         } catch(e) {
+           console.log("Erreur de compréhension du Bluetooth.", e);
+           receiveBuffer = ""; // Flush s'il y a un déraillement Json
+         }
+      }
+    }
+
+    async function sendToESP() {
+      let msgInput = document.getElementById('msg');
+      let text = msgInput.value.trim();
+      if(text === "") return;
+      if(!rxCharacteristic) { alert("Bluetooth non connecté"); return; }
+      
+      document.getElementById('btn-send').innerText = "Envoi...";
+      document.getElementById('btn-send').disabled = true;
+
+      // On ajoute un \n à la fin pour dire à l'ESP que la phrase est finie
+      let payload = text + "\n";
+      let encoder = new TextEncoder();
+      let data = encoder.encode(payload);
+      
+      try {
+        // Envoi par bloc de 100 octets pour ne pas saturer le tampon
+        for(let i=0; i<data.length; i+=100) { 
+           let chunk = data.slice(i, i+100);
+           await rxCharacteristic.writeValueWithoutResponse(chunk);
+           await new Promise(r => setTimeout(r, 15)); // petite respiration pour la puce ESP
+        }
+        msgInput.value = "";
+      } catch (error) {
+        console.error("Erreur d'envoi:", error);
+        alert("Echec de l'envoi.");
+      }
+      
+      document.getElementById('btn-send').innerText = "Diffuser";
+      document.getElementById('btn-send').disabled = false;
+    }
+
+    // ===== GESTION GRAPHIQUE (Même code qu'avant !) =====
+
+    function couleurDepuisMac(mac) {
+      let hash = 0;
+      for (let i = 0; i < mac.length; i++) {
+        hash = mac.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      let hue = Math.abs(hash) % 360;
+      return `hsl(${hue}, 70%, 75%)`;
+    }
+
+    let isScratching = false, currentElem = null, startX = 0, lastX = 0;
+    let lastTime = 0, startOffset = 0, velocity = 0, inertiaId = null;
+
+    function getCurrentOffset(elem) {
+      let t = window.getComputedStyle(elem).transform;
+      if (t && t !== 'none') {
+        let m = t.match(/matrix\(([^)]+)\)/);
+        if (m) { return parseFloat(m[1].split(',')[4] || 0); }
+      }
+      return parseFloat(elem.dataset.offset || 0) || 0;
+    }
+
+    function startScratch(e, elem) {
+      if (inertiaId) { cancelAnimationFrame(inertiaId); inertiaId = null; }
+      isScratching = true; currentElem = elem; elem.style.animation = "none";
+      const point = e.touches ? e.touches[0] : e;
+      startX = point.clientX; lastX = point.clientX; lastTime = performance.now();
+      startOffset = getCurrentOffset(elem);
+      elem.dataset.offset = startOffset;
+    }
+
+    function moveScratch(e) {
+      if (!isScratching || !currentElem) return;
+      const point = e.touches ? e.touches[0] : e;
+      let x = point.clientX, now = performance.now();
+      let delta = x - startX, newOffset = startOffset + delta;
+      currentElem.dataset.offset = newOffset;
+      currentElem.style.transform = `translateX(${newOffset}px)`;
+      let dx = x - lastX, dt = now - lastTime;
+      if (dt > 0) velocity = dx / dt;
+      lastX = x; lastTime = now;
+    }
+
+    function endScratch() {
+      if (!isScratching || !currentElem) return;
+      let elem = currentElem, offset = parseFloat(elem.dataset.offset || 0), v = velocity;
+      isScratching = false; currentElem = null; const friction = 0.95;
+      function step() {
+        v *= friction; offset += v * 16;
+        elem.dataset.offset = offset; elem.style.transform = `translateX(${offset}px)`;
+        if (Math.abs(v) < 0.01) {
+          elem.style.transform = "none";
+          let duree = Math.max(8, (elem.dataset.raw || "").length * 0.12);
+          elem.style.animation = `scroll-left ${duree}s linear infinite`;
+          return;
+        }
+        inertiaId = requestAnimationFrame(step);
+      }
+      inertiaId = requestAnimationFrame(step);
+    }
+
+    document.addEventListener("mousemove", moveScratch);
+    document.addEventListener("touchmove", moveScratch, {passive: false});
+    document.addEventListener("mouseup", endScratch);
+    document.addEventListener("touchend", endScratch);
+
+    function mettreAJourInterface(data) {
+      let container = document.getElementById('prompters');
+      let monMessage = data[0];
+      let othersData = data.slice(1);
+      
+      let monMsgContainer = document.getElementById('mon-message-container');
+      let monMsgTexte = document.getElementById('mon-message-texte');
+      if (monMessage && monMessage.texte && monMessage.texte !== "En attente d'inspiration...") {
+         monMsgContainer.style.display = "flex";
+         monMsgTexte.innerText = monMessage.texte;
+      }
+
+      othersData.sort((a, b) => a.rssi - b.rssi); 
+      
+      let existingIds = new Set();
+      Array.from(container.children).forEach(child => existingIds.add(child.id));
+      let newIds = new Set();
+
+      othersData.forEach((m, index) => {
+        let id = "msg-" + m.auteur;
+        newIds.add(id);
+        let line = document.getElementById(id);
+
+        let couleurUnqiue = couleurDepuisMac(m.auteur);
+        let texteComplet = m.texte + " &nbsp;&nbsp;&nbsp; 🌿 &nbsp;&nbsp;&nbsp; ";
+        let textRaw = m.texte;
+
+        if (!line) {
+          let duree = Math.max(8, textRaw.length * 0.12);
+          line = document.createElement('div');
+          line.className = "esp-line";
+          line.id = id;
+          line.style.borderColor = couleurUnqiue;
+          
+          let cartouche = document.createElement('div');
+          cartouche.className = "cartouche";
+          cartouche.innerText = m.nomReseau;
+          cartouche.style.color = couleurUnqiue;
+          
+          let riviere = document.createElement('div');
+          riviere.className = "riviere";
+          
+          let anim = document.createElement('div');
+          anim.className = "scrolling-text";
+          anim.id = "text-" + id;
+          anim.innerHTML = texteComplet;
+          anim.dataset.raw = textRaw;
+          anim.dataset.offset = 0;
+          anim.style.animation = `scroll-left ${duree}s linear infinite`;
+
+          anim.addEventListener("mousedown", (e) => startScratch(e, anim));
+          anim.addEventListener("touchstart", (e) => { e.preventDefault(); startScratch(e, anim); });
+
+          riviere.appendChild(anim);
+          line.appendChild(cartouche);
+          line.appendChild(riviere);
+          container.appendChild(line);
+        } else {
+          let anim = document.getElementById("text-" + id);
+          if (anim.dataset.raw !== textRaw) {
+            let duree = Math.max(8, textRaw.length * 0.12);
+            anim.innerHTML = texteComplet;
+            anim.dataset.raw = textRaw;
+            anim.dataset.offset = 0;
+            anim.style.transform = "none";
+            anim.style.animation = 'none';
+            anim.offsetHeight;
+            anim.style.animation = `scroll-left ${duree}s linear infinite`;
+          }
+        }
+      });
+
+      existingIds.forEach(id => {
+        if (!newIds.has(id)) {
+          let element = document.getElementById(id);
+          if (element) element.remove();
+        }
+      });
+      
+      othersData.forEach((m, i) => {
+        let line = document.getElementById("msg-" + m.auteur);
+        if(line) line.style.order = i; 
+      });
+    }
+
+  </script>
+</body>
+</html>
